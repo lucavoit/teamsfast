@@ -3,8 +3,13 @@
 //! offline. The network remains the source of truth; the archive mirrors
 //! it after every successful fetch.
 //!
-//! Key handling: a random 32-byte hex key in `archive.key` (0600) beside
-//! the database. Upgrading to the OS keyring is a later step.
+//! Key handling: a random 32-byte hex key in the OS keyring (service
+//! `teamsfast`, entry `archive-key`), so the key no longer sits beside
+//! the database it unlocks. An `archive.key` file from older versions is
+//! moved into the keyring and deleted once the keyring reads it back.
+//! Without a usable keyring the key stays in (or goes to) `archive.key`
+//! (0600) as before. A keyring that fails while an archive exists stops
+//! the archive for this run; a fresh key would orphan it.
 
 use anyhow::{Context, Result};
 use ost::api::{ChatInfo, MessageInfo};
@@ -28,24 +33,102 @@ pub fn default_paths() -> (PathBuf, PathBuf) {
     (state.join("archive.db"), state.join("archive.key"))
 }
 
-fn load_or_create_key(path: &Path) -> Result<String> {
-    if let Ok(text) = std::fs::read_to_string(path) {
-        let key = text.trim().to_string();
-        if key.len() >= 32 {
-            return Ok(key);
+/// Where the archive key lives when not in `archive.key`.
+trait KeyStore {
+    /// The stored key; `Ok(None)` when there is none yet.
+    fn get(&self) -> Result<Option<String>>;
+    fn set(&self, key: &str) -> Result<()>;
+}
+
+/// The OS keyring (libsecret / KWallet through the Secret Service).
+struct OsKeyring;
+
+impl OsKeyring {
+    fn entry() -> Result<keyring::Entry> {
+        keyring::Entry::new("teamsfast", "archive-key").context("keyring entry")
+    }
+}
+
+impl KeyStore for OsKeyring {
+    fn get(&self) -> Result<Option<String>> {
+        match Self::entry()?.get_password() {
+            Ok(key) => Ok(Some(key)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e).context("read archive key from the keyring"),
         }
     }
+
+    fn set(&self, key: &str) -> Result<()> {
+        Self::entry()?
+            .set_password(key)
+            .context("store archive key in the keyring")
+    }
+}
+
+fn read_key_file(path: &Path) -> Option<String> {
+    let key = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (key.len() >= 32).then_some(key)
+}
+
+fn write_key_file(path: &Path, key: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes)?;
-    let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(path, &key)?;
+    std::fs::write(path, key)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Store `key` and read it back; true only when the store holds it.
+fn store_verified(store: &dyn KeyStore, key: &str) -> bool {
+    match store.set(key).and_then(|()| store.get()) {
+        Ok(Some(back)) if back == key => true,
+        Ok(_) => {
+            log::warn!("archive key did not read back from the keyring");
+            false
+        }
+        Err(e) => {
+            log::warn!("{e:#}");
+            false
+        }
+    }
+}
+
+fn load_or_create_key(key_path: &Path, db_exists: bool, store: &dyn KeyStore) -> Result<String> {
+    // A key file from an older version (or a machine without a keyring):
+    // move it into the keyring, and delete the file only once the
+    // keyring gives the same key back.
+    if let Some(key) = read_key_file(key_path) {
+        if store_verified(store, &key) {
+            if let Err(e) = std::fs::remove_file(key_path) {
+                log::warn!("remove {}: {e}", key_path.display());
+            }
+        } else {
+            log::warn!("keeping the archive key in {}", key_path.display());
+        }
+        return Ok(key);
+    }
+    match store.get() {
+        Ok(Some(key)) if key.len() >= 32 => return Ok(key),
+        Ok(_) => {}
+        // A locked or unreachable keyring may still hold the key of the
+        // archive on disk: a fresh key now would orphan it for good.
+        Err(e) if db_exists => return Err(e.context("archive key unavailable")),
+        Err(e) => log::warn!("{e:#}"),
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)?;
+    let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    if !store_verified(store, &key) {
+        log::warn!(
+            "no usable keyring; archive key goes to {}",
+            key_path.display()
+        );
+        write_key_file(key_path, &key)?;
     }
     Ok(key)
 }
@@ -56,7 +139,7 @@ impl Archive {
         if let Some(dir) = db_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let key = load_or_create_key(&key_path)?;
+        let key = load_or_create_key(&key_path, db_path.exists(), &OsKeyring)?;
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open archive {db_path:?}"))?;
         conn.pragma_update(None, "key", &key)?;
@@ -352,6 +435,115 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// In-memory keyring: `fail` makes every call error (locked or
+    /// missing Secret Service), `garble` stores something else.
+    #[derive(Default)]
+    struct MemStore {
+        key: RefCell<Option<String>>,
+        fail: bool,
+        garble: bool,
+    }
+
+    impl KeyStore for MemStore {
+        fn get(&self) -> Result<Option<String>> {
+            anyhow::ensure!(!self.fail, "keyring locked");
+            Ok(self.key.borrow().clone())
+        }
+        fn set(&self, key: &str) -> Result<()> {
+            anyhow::ensure!(!self.fail, "keyring locked");
+            let stored = if self.garble {
+                "x".repeat(64)
+            } else {
+                key.to_string()
+            };
+            *self.key.borrow_mut() = Some(stored);
+            Ok(())
+        }
+    }
+
+    fn key_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "teamsfast-key-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn old_key_file_moves_into_the_keyring() {
+        let path = key_dir("move").join("archive.key");
+        std::fs::write(&path, "b".repeat(64)).unwrap();
+        let store = MemStore::default();
+        let key = load_or_create_key(&path, true, &store).unwrap();
+        assert_eq!(key, "b".repeat(64));
+        assert_eq!(store.key.borrow().as_deref(), Some(key.as_str()));
+        assert!(!path.exists(), "the key no longer sits beside the archive");
+        // The next start reads it from the keyring.
+        assert_eq!(load_or_create_key(&path, true, &store).unwrap(), key);
+    }
+
+    #[test]
+    fn key_file_stays_when_the_keyring_fails() {
+        let path = key_dir("stay").join("archive.key");
+        std::fs::write(&path, "c".repeat(64)).unwrap();
+        for store in [
+            MemStore {
+                fail: true,
+                ..Default::default()
+            },
+            MemStore {
+                garble: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                load_or_create_key(&path, true, &store).unwrap(),
+                "c".repeat(64)
+            );
+            assert!(path.exists(), "never delete the only copy");
+        }
+    }
+
+    #[test]
+    fn new_key_goes_to_the_keyring_only() {
+        let path = key_dir("new").join("archive.key");
+        let store = MemStore::default();
+        let key = load_or_create_key(&path, false, &store).unwrap();
+        assert_eq!(key.len(), 64);
+        assert_eq!(store.key.borrow().as_deref(), Some(key.as_str()));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn new_key_falls_back_to_the_file_without_a_keyring() {
+        let path = key_dir("nokeyring").join("archive.key");
+        let store = MemStore {
+            fail: true,
+            ..Default::default()
+        };
+        let key = load_or_create_key(&path, false, &store).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), key);
+        assert_eq!(load_or_create_key(&path, false, &store).unwrap(), key);
+    }
+
+    #[test]
+    fn locked_keyring_never_replaces_an_existing_archive_key() {
+        let path = key_dir("locked").join("archive.key");
+        let store = MemStore {
+            key: RefCell::new(Some("d".repeat(64))),
+            fail: true,
+            ..Default::default()
+        };
+        assert!(load_or_create_key(&path, true, &store).is_err());
+        assert!(!path.exists(), "no new key was minted");
+    }
 
     fn temp_archive(tag: &str) -> (Archive, PathBuf) {
         let dir = std::env::temp_dir().join(format!(

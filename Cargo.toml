@@ -79,6 +79,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 notify-rust = "4"
 # Open downloaded files with the system handler.
 open = "5"
+# The archive key in the OS keyring, beside the tokens teams-core keeps
+# there. Same version and backend as teams-core, so nothing new is built.
+keyring = { version = "3", features = ["sync-secret-service"] }
 # Native file dialog for attachments.
 rfd = "0.15"
 
