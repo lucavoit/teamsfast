@@ -5,6 +5,7 @@
 
 use crate::theme::Palette;
 use crate::ui::conversation::Action;
+use crate::ui::widgets::is_openable_link;
 use base64::Engine as _;
 use egui::{RichText, Ui};
 use serde_json::Value;
@@ -145,7 +146,11 @@ fn render_element(
             }
         }
         "Image" => {
-            if let Some(url) = el.get("url").and_then(|v| v.as_str()) {
+            if let Some(url) = el
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|u| is_openable_link(u))
+            {
                 let label = el
                     .get("altText")
                     .and_then(|v| v.as_str())
@@ -193,7 +198,7 @@ fn render_actions(ui: &mut Ui, acts: &[Value], pal: &Palette, actions: &mut Vec<
         match kind {
             "Action.OpenUrl" => {
                 let url = act.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                if url.is_empty() {
+                if !is_openable_link(url) {
                     continue;
                 }
                 any = true;

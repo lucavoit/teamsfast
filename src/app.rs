@@ -2302,7 +2302,9 @@ impl TeamsFastApp {
                     .ok();
             }
             Action::OpenLink(url) => {
-                if let Err(e) = open::that_detached(&url) {
+                if !crate::ui::widgets::is_openable_link(&url) {
+                    log::warn!("not opening a non-web link");
+                } else if let Err(e) = open::that_detached(&url) {
                     self.error = Some(format!("open link: {e:#}"));
                 }
             }

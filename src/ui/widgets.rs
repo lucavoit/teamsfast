@@ -264,6 +264,16 @@ fn decode_entities(s: &str) -> String {
 }
 
 /// URLs that point at downloadable files rather than web pages.
+/// Links a click may hand to the system: web pages and mail. Message
+/// HTML and cards come from the sender, and any other scheme (`file:`,
+/// `smb:`, an app's own handler) could open local files or launch apps.
+pub fn is_openable_link(url: &str) -> bool {
+    let low = url.trim_start().to_ascii_lowercase();
+    ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|scheme| low.starts_with(scheme))
+}
+
 pub fn is_file_url(url: &str) -> Option<String> {
     let low = url.to_ascii_lowercase();
     let name = url.split('/').next_back().unwrap_or("");
@@ -421,6 +431,13 @@ pub fn render_segments(
                     row_has_content = true;
                     if let Some(fname) = is_file_url(url) {
                         file(ui, &fname, url);
+                    } else if !is_openable_link(url) {
+                        // Not a web or mail link: show it, never open it.
+                        ui.label(if text.is_empty() {
+                            url.as_str()
+                        } else {
+                            text.as_str()
+                        });
                     } else if text.is_empty() {
                         ui.hyperlink(shorten_link_text(url));
                     } else {
@@ -538,4 +555,32 @@ pub fn day_separator(ui: &mut Ui, pal: &Palette, label: &str) {
         ],
         stroke,
     );
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::is_openable_link;
+
+    #[test]
+    fn only_web_and_mail_links_open() {
+        for url in [
+            "https://teams.microsoft.com/l/x",
+            "HTTP://example.com",
+            "mailto:a@example.com",
+            "  https://example.com",
+        ] {
+            assert!(is_openable_link(url), "{url}");
+        }
+        for url in [
+            "file:///home/u/Downloads/run.sh",
+            "smb://attacker.example/share",
+            "javascript:alert(1)",
+            "msteams:/l/call",
+            "vscode://open?file=/etc/passwd",
+            "/etc/passwd",
+            "",
+        ] {
+            assert!(!is_openable_link(url), "{url}");
+        }
+    }
 }
