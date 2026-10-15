@@ -42,7 +42,9 @@ egui_extras = { version = "0.36", features = ["svg", "image"] }
 # the repo is private and this machine's git auth is ssh-only.
 # `audio` enables the calling stack (cpal capture/playback + Opus/SRTP);
 # `video-cam` adds camera capture + H.264 send (v4l/openh264, no SDL2).
-ost = { git = "https://github.com/YacineSahli/teams-core", package = "teams-cli", features = [
+# Pinned to lucavoit/teams-core's security-fixes branch (token kept on
+# Microsoft media hosts, redirects re-checked per hop) until upstream has it.
+ost = { git = "https://github.com/lucavoit/teams-core", rev = "0061f8c764ddc51b0e142113b3afc694a342287e", package = "teams-cli", features = [
     "audio",
     "video-cam",
 ] }

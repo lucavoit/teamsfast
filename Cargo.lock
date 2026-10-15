@@ -5293,6 +5293,7 @@ dependencies = [
 [[package]]
 name = "teams-cli"
 version = "0.1.0"
+source = "git+https://github.com/lucavoit/teams-core?rev=0061f8c764ddc51b0e142113b3afc694a342287e#0061f8c764ddc51b0e142113b3afc694a342287e"
 dependencies = [
  "aes",
  "anyhow",
