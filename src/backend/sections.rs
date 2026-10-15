@@ -191,8 +191,7 @@ pub async fn download_drive_file(
     let Some(c) = client(ses) else {
         return;
     };
-    let safe: String = name.chars().filter(|c| !"/\0".contains(*c)).take(120).collect();
-    let dest = dirs_downloads().join(if safe.is_empty() { "download".into() } else { safe });
+    let dest = dirs_downloads().join(super::media::safe_file_name(name));
     match ost::api::download_file_data(c, drive_id, item_id, &dest.to_string_lossy()).await {
         Ok(bytes) => {
             let _ = tx.send(Event::DownloadDone {

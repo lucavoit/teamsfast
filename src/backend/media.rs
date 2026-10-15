@@ -106,7 +106,7 @@ pub async fn download(ses: &Session, tx: &Sender<Event>, url: &str, name: &str) 
         Ok(mb) => {
             let dir = dirs_home().join("Downloads");
             let _ = std::fs::create_dir_all(&dir);
-            let path = numbered_variant(&dir, name);
+            let path = numbered_variant(&dir, &safe_file_name(name));
             match std::fs::write(&path, &mb.data) {
                 Ok(()) => {
                     let _ = tx.send(Event::DownloadDone {
@@ -135,6 +135,33 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// A file name from a message or a drive listing, safe to join to the
+/// Downloads folder. The sender chooses it, so `../.bashrc` or an
+/// absolute path once wrote outside Downloads (`PathBuf::join` replaces
+/// the folder with an absolute path). Keeps only the last component
+/// (either separator), drops control characters and leading dots, caps
+/// the length, and never comes back empty.
+pub(super) fn safe_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let printable: String = last
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .take(120)
+        .collect();
+    let name = printable.trim().trim_start_matches('.').trim();
+    if name.is_empty() {
+        "download".into()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Direction marks and overrides, which can make `evil\u{202e}fdp.exe`
+/// display as `evilexe.pdf`.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// `name.ext` → `name.ext`, then `name (1).ext`, `name (2).ext`, …
 fn numbered_variant(dir: &PathBuf, name: &str) -> PathBuf {
     let first = dir.join(name);
@@ -159,3 +186,36 @@ fn numbered_variant(dir: &PathBuf, name: &str) -> PathBuf {
 }
 
 use std::collections::HashMap;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_names_stay_in_the_folder() {
+        let dir = PathBuf::from("/home/u/Downloads");
+        for (name, want) in [
+            ("Plan.docx", "Plan.docx"),
+            ("../.bashrc", "bashrc"),
+            ("../../.config/autostart/x.desktop", "x.desktop"),
+            ("/home/u/.ssh/authorized_keys", "authorized_keys"),
+            ("..\\..\\evil.bat", "evil.bat"),
+            ("..", "download"),
+            (".", "download"),
+            ("", "download"),
+            ("a/", "download"),
+            ("re\u{202e}port\n.pdf", "report.pdf"),
+        ] {
+            let got = safe_file_name(name);
+            assert_eq!(got, want, "{name:?}");
+            let path = dir.join(&got);
+            assert_eq!(
+                path.parent(),
+                Some(dir.as_path()),
+                "{name:?} stays in Downloads"
+            );
+        }
+        assert_eq!(safe_file_name("evil\u{202e}fdp.exe"), "evilfdp.exe");
+        assert_eq!(safe_file_name(&"x".repeat(500)).len(), 120);
+    }
+}
